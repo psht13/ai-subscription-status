@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 final class CodexStatusProvider {
@@ -25,23 +26,27 @@ final class CodexStatusProvider {
     }
 
     private func unavailableSnapshot(message: String) -> ProviderSnapshot {
-        ProviderSnapshot(
+        let version = versionLabel
+        return ProviderSnapshot(
             id: .codex,
             name: "GPT / Codex",
-            detail: versionLabel ?? "Codex CLI unavailable",
+            detail: version ?? "Codex CLI unavailable",
             health: .unavailable,
             metrics: [],
             footer: message,
-            dashboardURL: URL(string: "https://chatgpt.com/codex/settings/usage")!
+            dashboardURL: URL(string: "https://chatgpt.com/codex/settings/usage")!,
+            versionLabel: version
         )
     }
 }
 
-private final class CodexAppServerClient {
+final class CodexAppServerClient {
     private let executable: String
+    private let timeout: TimeInterval
 
-    init(executable: String) {
+    init(executable: String, timeout: TimeInterval = 30) {
         self.executable = executable
+        self.timeout = timeout
     }
 
     func readRateLimits() throws -> [String: Any] {
@@ -57,19 +62,14 @@ private final class CodexAppServerClient {
 
         try process.run()
 
-        let timeoutItem = DispatchWorkItem {
-            if process.isRunning {
-                process.terminate()
-            }
-        }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 12, execute: timeoutItem)
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
 
         defer {
-            timeoutItem.cancel()
             try? stdin.fileHandleForWriting.close()
             if process.isRunning {
                 process.terminate()
             }
+            try? stdout.fileHandleForReading.close()
         }
 
         try send(
@@ -91,7 +91,7 @@ private final class CodexAppServerClient {
         var initialized = false
 
         while true {
-            let chunk = stdout.fileHandleForReading.availableData
+            let chunk = try readChunk(from: stdout.fileHandleForReading, deadline: deadline)
             if chunk.isEmpty {
                 break
             }
@@ -106,7 +106,15 @@ private final class CodexAppServerClient {
                 }
 
                 let id = JSONAccess.int(object["id"])
+                guard id == 1 || id == 2 else { continue }
+                if let error = object["error"] as? [String: Any],
+                   let message = JSONAccess.string(error["message"]) {
+                    throw StatusError.unavailable(message)
+                }
                 if id == 1, !initialized {
+                    guard object["result"] is [String: Any] else {
+                        throw StatusError.invalidResponse("Codex returned an invalid initialization response")
+                    }
                     initialized = true
                     try send(
                         ["method": "initialized", "params": [:]],
@@ -123,18 +131,39 @@ private final class CodexAppServerClient {
                 if let result = object["result"] as? [String: Any] {
                     return result
                 }
-                if let error = object["error"] as? [String: Any],
-                   let message = JSONAccess.string(error["message"]) {
-                    throw StatusError.unavailable(message)
-                }
                 throw StatusError.invalidResponse("Codex returned an invalid rate-limit response")
             }
         }
 
         if initialized {
-            throw StatusError.timedOut("Codex rate-limit request timed out")
+            throw StatusError.unavailable("Codex app-server closed before returning usage")
         }
         throw StatusError.unavailable("Codex app-server did not initialize")
+    }
+
+    // A deadline on the read itself also works if a CLI child keeps stdout open
+    // after its parent exits. Killing only the parent can leave availableData blocked.
+    private func readChunk(from handle: FileHandle, deadline: TimeInterval) throws -> Data {
+        while true {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else {
+                throw StatusError.timedOut("Codex rate-limit request timed out")
+            }
+            var descriptor = pollfd(fd: handle.fileDescriptor, events: Int16(POLLIN), revents: 0)
+            let result = poll(&descriptor, 1, Int32(ceil(remaining * 1_000)))
+            if result == 0 { continue }
+            if result < 0 {
+                if errno == EINTR { continue }
+                throw StatusError.unavailable("Could not read from Codex app-server")
+            }
+            var bytes = [UInt8](repeating: 0, count: 65_536)
+            let count = Darwin.read(handle.fileDescriptor, &bytes, bytes.count)
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw StatusError.unavailable("Could not read from Codex app-server")
+            }
+            return Data(bytes.prefix(count))
+        }
     }
 
     private func send(_ object: [String: Any], to handle: FileHandle) throws {
@@ -222,7 +251,9 @@ enum CodexStatusParser {
             health: metrics.isEmpty ? .warning : .ready,
             metrics: metrics,
             footer: footer,
-            dashboardURL: URL(string: "https://chatgpt.com/codex/settings/usage")!
+            dashboardURL: URL(string: "https://chatgpt.com/codex/settings/usage")!,
+            planLabel: plan,
+            versionLabel: versionLabel
         )
     }
 

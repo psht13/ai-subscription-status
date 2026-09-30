@@ -37,13 +37,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         renderLoadingMenu()
         refreshNow(nil)
 
-        let timer = Timer(timeInterval: 300, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refreshNow(nil)
-            }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        refreshTimer = timer
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(refreshAfterWake(_:)),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
 
         let cliTimer = Timer(timeInterval: CLIUpdateManager.retryInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -57,28 +56,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
         updateTimer?.invalidate()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         coordinator.shutdown()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
         guard !isRefreshing, !isUpdatingCLIs else { return }
-        if let snapshot, Date().timeIntervalSince(snapshot.refreshedAt) >= 90 {
+        if let snapshot,
+           Date().timeIntervalSince(snapshot.refreshedAt) >= (snapshot.hasUnavailableProvider ? 15 : 90) {
             refreshNow(nil)
             return
         }
+        if let snapshot { render(snapshot: snapshot) }
         requestCLIUpdates(force: false)
+    }
+
+    @objc private func refreshAfterWake(_ notification: Notification) {
+        // Give the network a chance to reconnect; failures use the normal retry schedule.
+        scheduleRefresh(after: 3)
+    }
+
+    private func scheduleRefresh(after interval: TimeInterval) {
+        refreshTimer?.invalidate()
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshNow(nil)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        refreshTimer = timer
     }
 
     @objc private func refreshNow(_ sender: Any?) {
         guard !isRefreshing, !isUpdatingCLIs else { return }
+        refreshTimer?.invalidate()
         isRefreshing = true
         showRefreshingTitle()
+        if let snapshot { render(snapshot: snapshot) }
 
         Task { [weak self] in
             guard let self else { return }
             let newSnapshot = await coordinator.refresh()
             snapshot = newSnapshot
             isRefreshing = false
+            scheduleRefresh(after: coordinator.nextRefreshInterval)
             render(snapshot: newSnapshot)
             if pendingForcedUpdate {
                 pendingForcedUpdate = false
@@ -152,105 +173,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func renderLoadingMenu() {
         statusItem.button?.title = " …"
         menu.removeAllItems()
-        menu.addItem(headerItem(title: "AI Subscription Status"))
-        menu.addItem(disabledItem(title: "Reading GPT / Codex…", color: .secondaryLabelColor))
+        addSummary(provider: nil)
         addFooterActions()
     }
 
     private func render(snapshot: OverallSnapshot) {
         updateStatusBar(snapshot: snapshot)
         menu.removeAllItems()
-        menu.addItem(headerItem(title: "AI Subscription Status"))
-        menu.addItem(
-            disabledItem(
-                title: "Updated \(StatusFormatting.relative(snapshot.refreshedAt)) · refreshes every 5m",
-                color: .secondaryLabelColor,
-                size: 11
-            )
-        )
-        menu.addItem(.separator())
-
-        for (index, provider) in snapshot.providers.enumerated() {
-            addProvider(provider)
-            if index < snapshot.providers.count - 1 {
-                menu.addItem(.separator())
-            }
+        for provider in snapshot.providers {
+            addSummary(provider: provider, refreshedAt: snapshot.refreshedAt)
         }
-
         addFooterActions()
     }
 
-    private func addProvider(_ provider: ProviderSnapshot) {
-        let headerColor = healthColor(provider.health)
-        let providerTitle = "\(healthSymbol(provider.health))  \(provider.name)"
-        menu.addItem(
-            disabledItem(
-                title: providerTitle,
-                color: headerColor,
-                font: .systemFont(ofSize: 13, weight: .semibold)
-            )
-        )
-        if !provider.detail.isEmpty {
-            menu.addItem(
-                disabledItem(
-                    title: "     \(provider.detail)",
-                    color: .secondaryLabelColor,
-                    size: 11
-                )
-            )
-        }
-
-        for metric in provider.metrics {
-            let reset = metric.resetText.map { " · \($0)" } ?? ""
-            let title = "     \(metric.label): \(metric.value)\(reset)"
-            menu.addItem(
-                disabledItem(
-                    title: title,
-                    color: metricColor(metric.remainingPercent),
-                    font: .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-                )
-            )
-        }
-
-        if let footer = provider.footer {
-            for line in wrapped(footer, width: 76) {
-                menu.addItem(
-                    disabledItem(
-                        title: "     \(line)",
-                        color: .tertiaryLabelColor,
-                        size: 10
-                    )
-                )
-            }
-        }
+    private func addSummary(provider: ProviderSnapshot?, refreshedAt: Date? = nil) {
+        let item = NSMenuItem(title: "Usage summary", action: nil, keyEquivalent: "")
+        item.view = UsageSummaryView(provider: provider, refreshedAt: refreshedAt)
+        item.identifier = NSUserInterfaceItemIdentifier("ai_subscription_usage_summary")
+        menu.addItem(item)
     }
 
     private func addFooterActions() {
         menu.addItem(.separator())
 
-        addCLIUpdateActions()
-
-        let dashboards = NSMenuItem(title: "Open Usage Dashboards", action: nil, keyEquivalent: "")
-        dashboards.identifier = NSUserInterfaceItemIdentifier("ai_subscription_dashboards_menu")
-        let dashboardMenu = NSMenu(title: "Open Usage Dashboards")
-        for provider in snapshot?.providers ?? fallbackDashboardProviders() {
-            let item = NSMenuItem(
-                title: provider.name,
-                action: #selector(openDashboard(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = provider.dashboardURL
-            item.identifier = NSUserInterfaceItemIdentifier(
-                "ai_subscription_\(providerIdentifier(provider.id))_dashboard_link"
-            )
-            dashboardMenu.addItem(item)
+        let refreshTitle: String
+        if isRefreshing {
+            refreshTitle = "Refreshing…"
+        } else if isUpdatingCLIs {
+            refreshTitle = "Updating Codex…"
+        } else {
+            refreshTitle = "Refresh Usage"
         }
-        dashboards.submenu = dashboardMenu
-        menu.addItem(dashboards)
-
         let refresh = NSMenuItem(
-            title: isRefreshing ? "Refreshing…" : (isUpdatingCLIs ? "CLI Update in Progress…" : "Refresh Now"),
+            title: refreshTitle,
             action: #selector(refreshNow(_:)),
             keyEquivalent: "r"
         )
@@ -259,6 +214,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh.isEnabled = !isRefreshing && !isUpdatingCLIs
         refresh.identifier = NSUserInterfaceItemIdentifier("ai_subscription_refresh_button")
         menu.addItem(refresh)
+
+        let providers = snapshot?.providers ?? fallbackDashboardProviders()
+        let dashboard = NSMenuItem(title: "Open Usage Dashboard", action: nil, keyEquivalent: "")
+        dashboard.identifier = NSUserInterfaceItemIdentifier("ai_subscription_dashboards_menu")
+        if providers.count == 1, let provider = providers.first {
+            dashboard.action = #selector(openDashboard(_:))
+            dashboard.target = self
+            dashboard.representedObject = provider.dashboardURL
+        } else {
+            let submenu = NSMenu(title: "Usage Dashboards")
+            for provider in providers {
+                let item = NSMenuItem(title: provider.name, action: #selector(openDashboard(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = provider.dashboardURL
+                submenu.addItem(item)
+            }
+            dashboard.submenu = submenu
+        }
+        menu.addItem(dashboard)
+        menu.addItem(.separator())
+        addCLIUpdateActions()
 
         let source = NSMenuItem(
             title: "Open Project Folder",
@@ -286,6 +262,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         parent.identifier = NSUserInterfaceItemIdentifier("ai_subscription_cli_updates_menu")
 
         let submenu = NSMenu(title: "CLI Updates")
+        if let version = snapshot?.providers.first?.versionLabel {
+            submenu.addItem(disabledItem(title: version, color: .secondaryLabelColor, size: 12))
+            submenu.addItem(.separator())
+        }
         let automatic = NSMenuItem(
             title: "Automatically Update When Idle",
             action: #selector(toggleAutomaticCLIUpdates(_:)),
@@ -372,8 +352,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title: String
         let color: NSColor
         if let remaining = snapshot.minimumRemainingPercent {
-            title = " \(StatusFormatting.percent(remaining))%"
-            color = metricColor(remaining)
+            let prefix = snapshot.hasCachedUsage ? "~" : ""
+            title = " \(prefix)\(StatusFormatting.percent(remaining))%"
+            color = snapshot.hasCachedUsage ? .systemOrange : metricColor(remaining)
         } else if snapshot.hasUnavailableProvider {
             title = " !"
             color = .systemRed
@@ -390,8 +371,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ]
         )
         statusItem.button?.toolTip = snapshot.hasUnavailableProvider
-            ? "AI subscriptions · one or more sources unavailable"
-            : "AI subscriptions · lowest known quota: \(title.trimmingCharacters(in: .whitespaces))"
+            ? "AI subscriptions · refresh failed, retrying automatically\(snapshot.hasCachedUsage ? "; showing last known usage" : "")"
+            : "AI usage · \(title.trimmingCharacters(in: .whitespaces)) remaining"
     }
 
     private func showRefreshingTitle() {
@@ -402,14 +383,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
                 .foregroundColor: NSColor.secondaryLabelColor,
             ]
-        )
-    }
-
-    private func headerItem(title: String) -> NSMenuItem {
-        disabledItem(
-            title: title,
-            color: .labelColor,
-            font: .systemFont(ofSize: 14, weight: .bold)
         )
     }
 
@@ -429,24 +402,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ]
         )
         return item
-    }
-
-    private func healthColor(_ health: ProviderHealth) -> NSColor {
-        switch health {
-        case .ready: return .systemGreen
-        case .configured: return .systemBlue
-        case .warning: return .systemOrange
-        case .unavailable: return .systemRed
-        }
-    }
-
-    private func healthSymbol(_ health: ProviderHealth) -> String {
-        switch health {
-        case .ready: return "●"
-        case .configured: return "◐"
-        case .warning: return "▲"
-        case .unavailable: return "×"
-        }
     }
 
     private func metricColor(_ remaining: Double?) -> NSColor {
@@ -481,23 +436,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func wrapped(_ text: String, width: Int) -> [String] {
-        var lines: [String] = []
-        var current = ""
-        for word in text.split(separator: " ").map(String.init) {
-            if current.isEmpty {
-                current = word
-            } else if current.count + word.count + 1 <= width {
-                current += " " + word
-            } else {
-                lines.append(current)
-                current = word
-            }
-        }
-        if !current.isEmpty { lines.append(current) }
-        return lines
-    }
-
     private func fallbackDashboardProviders() -> [ProviderSnapshot] {
         [
             ProviderSnapshot(
@@ -512,10 +450,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ]
     }
 
-    private func providerIdentifier(_ id: ProviderID) -> String {
-        switch id {
-        case .codex: return "gpt"
-        case .kimi: return "kimi"
-        }
-    }
 }

@@ -46,6 +46,9 @@ struct ProviderSnapshot {
     let metrics: [StatusMetric]
     let footer: String?
     let dashboardURL: URL
+    var cachedAt: Date? = nil
+    var planLabel: String? = nil
+    var versionLabel: String? = nil
 
     var minimumRemainingPercent: Double? {
         metrics.compactMap(\.remainingPercent).min()
@@ -62,6 +65,46 @@ struct OverallSnapshot {
 
     var hasUnavailableProvider: Bool {
         providers.contains { $0.health == .unavailable }
+    }
+
+    var hasCachedUsage: Bool {
+        providers.contains { $0.cachedAt != nil }
+    }
+}
+
+struct UsageRefreshState {
+    private var lastSuccess: (provider: ProviderSnapshot, date: Date)?
+    private var consecutiveFailures = 0
+
+    var nextRefreshInterval: TimeInterval {
+        guard consecutiveFailures > 0 else { return 300 }
+        return min(300, 15 * pow(2, Double(consecutiveFailures - 1)))
+    }
+
+    mutating func record(_ provider: ProviderSnapshot, at date: Date) -> OverallSnapshot {
+        var displayed = provider
+        if provider.health == .unavailable {
+            consecutiveFailures = min(consecutiveFailures + 1, 6)
+            if let lastSuccess {
+                displayed = ProviderSnapshot(
+                    id: provider.id,
+                    name: provider.name,
+                    detail: lastSuccess.provider.detail,
+                    health: .unavailable,
+                    metrics: lastSuccess.provider.metrics,
+                    footer: provider.footer,
+                    dashboardURL: provider.dashboardURL,
+                    cachedAt: lastSuccess.date,
+                    planLabel: lastSuccess.provider.planLabel,
+                    versionLabel: provider.versionLabel
+                )
+            }
+        } else {
+            consecutiveFailures = 0
+            // A successful response with no quota must also replace older data.
+            lastSuccess = provider.metrics.isEmpty ? nil : (provider, date)
+        }
+        return OverallSnapshot(providers: [displayed], refreshedAt: date)
     }
 }
 
@@ -104,17 +147,16 @@ enum StatusFormatting {
     }
 
     static func quotaWindow(minutes: Int) -> String {
-        guard minutes > 0 else { return "window" }
-        if minutes % 10_080 == 0 {
-            return "\(minutes / 10_080 * 7)d"
-        }
+        guard minutes > 0 else { return "Usage allowance" }
+        if minutes == 10_080 { return "Weekly allowance" }
+        if minutes == 1_440 { return "Daily allowance" }
         if minutes % 1_440 == 0 {
-            return "\(minutes / 1_440)d"
+            return "\(minutes / 1_440)-day allowance"
         }
         if minutes % 60 == 0 {
-            return "\(minutes / 60)h"
+            return "\(minutes / 60)-hour allowance"
         }
-        return "\(minutes)m"
+        return "\(minutes)-minute allowance"
     }
 
     static func resetText(for date: Date, now: Date = Date()) -> String {

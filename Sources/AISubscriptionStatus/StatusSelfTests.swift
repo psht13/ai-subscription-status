@@ -13,11 +13,13 @@ enum StatusSelfTestError: Error, CustomStringConvertible {
 enum StatusSelfTests {
     static func run() throws {
         try testCodexParser()
+        try testUsageRefreshRecovery()
+        try testCodexTransport()
         try testKimiParser()
         try testCLIIdleDetection()
         try testKimiUpdateOutput()
-        try check(StatusFormatting.quotaWindow(minutes: 300) == "5h", "300 minutes should format as 5h")
-        try check(StatusFormatting.quotaWindow(minutes: 10_080) == "7d", "10080 minutes should format as 7d")
+        try check(StatusFormatting.quotaWindow(minutes: 300) == "5-hour allowance", "300 minutes should have a readable window label")
+        try check(StatusFormatting.quotaWindow(minutes: 10_080) == "Weekly allowance", "10080 minutes should format as a weekly allowance")
         let now = Date()
         try check(StatusFormatting.relative(now, now: now) == "just now", "Current refreshes should say just now")
     }
@@ -53,7 +55,7 @@ enum StatusSelfTests {
         try check(snapshot.health == .ready, "Codex fixture should be ready")
         try check(snapshot.detail == "Pro · Codex 1.2.3", "Codex plan/version parsing failed")
         try check(snapshot.metrics.count == 2, "Codex should expose two fixture windows")
-        try check(snapshot.metrics.first?.label == "Codex · 7d", "Codex window label parsing failed")
+        try check(snapshot.metrics.first?.label == "Codex · Weekly allowance", "Codex window label parsing failed")
         try check(snapshot.minimumRemainingPercent == 75, "Codex used-to-remaining conversion failed")
         try check(snapshot.footer?.hasPrefix("Credits balance: 123") == true, "Codex credits parsing failed")
     }
@@ -104,6 +106,118 @@ enum StatusSelfTests {
         )
         try check(currentWireSnapshot.metrics.first?.label == "1w limit", "Kimi current window label parsing failed")
         try check(currentWireSnapshot.metrics.first?.resetText != nil, "Kimi fractional reset timestamp parsing failed")
+    }
+
+    private static func testUsageRefreshRecovery() throws {
+        var state = UsageRefreshState()
+        let now = Date()
+        let ready = CodexStatusParser.parse(result: [
+            "rateLimits": [
+                "primary": ["usedPercent": 25, "windowDurationMins": 10_080],
+            ],
+        ], versionLabel: nil)
+        let failed = ProviderSnapshot(
+            id: .codex, name: "GPT / Codex", detail: "", health: .unavailable,
+            metrics: [], footer: "Request timed out", dashboardURL: ready.dashboardURL
+        )
+        let firstFailure = state.record(failed, at: now)
+        try check(firstFailure.minimumRemainingPercent == nil, "Do not invent usage before the first success")
+        try check(state.nextRefreshInterval == 15, "First failure should retry after 15 seconds")
+        _ = state.record(ready, at: now)
+        try check(state.nextRefreshInterval == 300, "Success should restore normal polling")
+
+        for (index, interval) in [15.0, 30, 60, 120, 240, 300, 300].enumerated() {
+            let snapshot = state.record(failed, at: now.addingTimeInterval(Double(index + 1) * 60))
+            try check(snapshot.minimumRemainingPercent == 75, "Failures must retain the last known quota")
+            try check(snapshot.hasUnavailableProvider && snapshot.hasCachedUsage, "Cached usage must remain visibly unavailable/stale")
+            try check(snapshot.providers[0].cachedAt == now, "Repeated failures must not advance the success timestamp")
+            try check(snapshot.providers[0].footer == failed.footer, "Retain the actual error with cached usage")
+            try check(state.nextRefreshInterval == interval, "Failure retries should back off and stop at five minutes")
+        }
+        let recovered = state.record(ready, at: now.addingTimeInterval(600))
+        try check(!recovered.hasCachedUsage && !recovered.hasUnavailableProvider, "Recovery should clear the stale/error state")
+        try check(state.nextRefreshInterval == 300, "Recovery should reset retry backoff")
+
+        let empty = CodexStatusParser.parse(result: [:], versionLabel: nil)
+        _ = state.record(empty, at: now)
+        let afterEmpty = state.record(failed, at: now)
+        try check(!afterEmpty.hasCachedUsage, "An authoritative empty quota must clear older cached usage")
+    }
+
+    private static func testCodexTransport() throws {
+        let initialize = """
+        IFS= read -r request
+        printf '%s\\n' '{"id":1,"result":{}}'
+        IFS= read -r notification
+        IFS= read -r request
+        """
+        try withCodexServer(script: initialize + """
+
+        printf '%s\\n' '{"method":"account/updated","params":{}}'
+        printf '%s' '{"id":2,"result":'
+        sleep 0.1
+        printf '%s\\n' '{"rateLimits":{"primary":{"usedPercent":25,"windowDurationMins":10080}}}}'
+        """) { client in
+            let result = try client.readRateLimits()
+            let snapshot = CodexStatusParser.parse(result: result, versionLabel: nil)
+            try check(snapshot.minimumRemainingPercent == 75, "Read complete JSON across split writes and ignore notifications")
+        }
+        try withCodexServer(script: """
+        IFS= read -r request
+        printf '%s\\n' '{"id":1,"error":{"code":-32600,"message":"Initialization rejected"}}'
+        """) { client in
+            do {
+                _ = try client.readRateLimits()
+                throw StatusSelfTestError.failed("Initialization errors must fail immediately")
+            } catch let error as StatusError {
+                try check(error.localizedDescription == "Initialization rejected", "Do not mask initialization errors as timeouts")
+            }
+        }
+        try withCodexServer(script: initialize + """
+
+        printf '%s\\n' '{"id":2,"error":{"code":-32000,"message":"Sign in required"}}'
+        """) { client in
+            do {
+                _ = try client.readRateLimits()
+                throw StatusSelfTestError.failed("Authentication errors must not be accepted as usage")
+            } catch let error as StatusError {
+                try check(error.localizedDescription == "Sign in required", "Preserve authentication errors")
+            }
+        }
+        try withCodexServer(script: initialize + "\nexit 0\n") { client in
+            do {
+                _ = try client.readRateLimits()
+                throw StatusSelfTestError.failed("An early exit must fail")
+            } catch let error as StatusError {
+                try check(error.localizedDescription == "Codex app-server closed before returning usage", "An early exit is not a timeout")
+            }
+        }
+        try withCodexServer(script: initialize + "\nexec /bin/sleep 5\n", timeout: 0.2) { client in
+            let start = ProcessInfo.processInfo.systemUptime
+            do {
+                _ = try client.readRateLimits()
+                throw StatusSelfTestError.failed("A hung server must time out")
+            } catch let error as StatusError {
+                guard case .timedOut = error else {
+                    throw StatusSelfTestError.failed("A hung server should report a timeout")
+                }
+                try check(ProcessInfo.processInfo.systemUptime - start < 2, "The read deadline must bound a hung server")
+            }
+        }
+    }
+
+    private static func withCodexServer(
+        script: String,
+        timeout: TimeInterval = 2,
+        checkClient: (CodexAppServerClient) throws -> Void
+    ) throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("codex-fixture")
+        try ("#!/bin/sh\n" + script + "\n").write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        try checkClient(CodexAppServerClient(executable: executable.path, timeout: timeout))
     }
 
     private static func testCLIIdleDetection() throws {
