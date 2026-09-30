@@ -3,10 +3,8 @@ import Foundation
 enum StatusDiagnostics {
     static func printLiveStatus() {
         let codex = CodexStatusProvider()
-        let kimi = KimiStatusProvider()
-        defer { kimi.stop() }
 
-        let providers = [codex.fetch(), kimi.fetch()]
+        let providers = [codex.fetch()]
         for provider in providers {
             print("\(provider.name) | \(healthName(provider.health)) | \(provider.detail)")
             for metric in provider.metrics {

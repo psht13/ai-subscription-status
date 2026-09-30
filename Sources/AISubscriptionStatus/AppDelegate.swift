@@ -153,7 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.title = " …"
         menu.removeAllItems()
         menu.addItem(headerItem(title: "AI Subscription Status"))
-        menu.addItem(disabledItem(title: "Reading GPT and Kimi…", color: .secondaryLabelColor))
+        menu.addItem(disabledItem(title: "Reading GPT / Codex…", color: .secondaryLabelColor))
         addFooterActions()
     }
 
@@ -325,7 +325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let results = Dictionary(
             uniqueKeysWithValues: updateManager.savedResults().map { ($0.providerID, $0) }
         )
-        for providerID in ProviderID.allCases {
+        for providerID in ProviderID.enabledCases {
             if let result = results[providerID] {
                 submenu.addItem(
                     disabledItem(
@@ -508,15 +508,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 metrics: [],
                 footer: nil,
                 dashboardURL: URL(string: "https://chatgpt.com/codex/settings/usage")!
-            ),
-            ProviderSnapshot(
-                id: .kimi,
-                name: "Kimi",
-                detail: "",
-                health: .configured,
-                metrics: [],
-                footer: nil,
-                dashboardURL: URL(string: "https://www.kimi.com/code/console?from=kfc_overview_topbar")!
             ),
         ]
     }

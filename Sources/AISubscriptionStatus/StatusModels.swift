@@ -4,6 +4,9 @@ enum ProviderID: Int, CaseIterable, Comparable {
     case codex
     case kimi
 
+    // Kimi is intentionally disabled while its local installation is not in use.
+    static let enabledCases: [ProviderID] = [.codex]
+
     static func < (lhs: ProviderID, rhs: ProviderID) -> Bool {
         lhs.rawValue < rhs.rawValue
     }

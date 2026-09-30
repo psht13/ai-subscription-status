@@ -58,11 +58,11 @@ final class CLIUpdateManager {
 
     func shouldRunAutomaticUpdate(now: Date = Date()) -> Bool {
         guard automaticUpdatesEnabled else { return false }
-        return ProviderID.allCases.contains { preferences.isDue($0, now: now) }
+        return ProviderID.enabledCases.contains { preferences.isDue($0, now: now) }
     }
 
     func savedResults() -> [CLIUpdateResult] {
-        ProviderID.allCases.compactMap(preferences.savedResult)
+        ProviderID.enabledCases.compactMap(preferences.savedResult)
     }
 
     func preview() -> [CLIUpdatePreview] {
@@ -289,12 +289,6 @@ final class CLIUpdateManager {
                 executable: ExecutableLocator.find("codex"),
                 strategy: .selfUpdate(arguments: ["update"]),
                 commandDescription: "codex update"
-            ),
-            CLIUpdateSpec(
-                providerID: .kimi,
-                executable: ExecutableLocator.find("kimi", preferred: ["~/.kimi-code/bin/kimi"]),
-                strategy: .kimiNative,
-                commandDescription: "kimi update + official native installer"
             ),
         ]
     }
