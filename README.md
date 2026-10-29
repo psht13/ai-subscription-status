@@ -1,6 +1,6 @@
 # AI Subscription Status
 
-A native macOS menu-bar utility for the locally authenticated Codex CLI.
+A native macOS menu-bar utility for the locally authenticated Codex and Kimi Code CLIs.
 
 The menu-bar percentage is the lowest known remaining quota across providers that expose live quota data. Colors follow the reference behavior: normal above 20%, orange at 11–20%, and red at 10% or below.
 
@@ -9,6 +9,7 @@ Open the menu for a readable usage summary: the plan, allowance window, percenta
 ## Data sources
 
 - GPT / Codex: live ChatGPT plan windows and credits through `codex app-server` and `account/rateLimits/read`.
+- Kimi: live subscription limits, reset times, and extra usage balance through the authenticated local Kimi Code usage server. Sign in with `kimi login` first. Each provider retains its own last successful usage during refresh failures.
 
 ## Build and install
 

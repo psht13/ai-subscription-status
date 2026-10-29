@@ -172,10 +172,18 @@ final class KimiStatusProvider {
             }
             let raw = String(trimmed[trimmed.index(after: firstQuote)..<lastQuote])
             let model = raw.split(separator: "/").last.map(String.init) ?? raw
-            if model.lowercased() == "k3" { return "K3" }
+            var inModel = false
+            for configLine in config.split(separator: "\n") {
+                let value = configLine.trimmingCharacters(in: .whitespaces)
+                if value.hasPrefix("[") {
+                    inModel = value == "[models.\"\(raw)\"]"
+                } else if inModel, value.hasPrefix("display_name"),
+                          let start = value.firstIndex(of: "\""),
+                          let end = value.lastIndex(of: "\""), start < end {
+                    return String(value[value.index(after: start)..<end])
+                }
+            }
             return model
-                .replacingOccurrences(of: "kimi-for-coding-highspeed", with: "K2.7 HighSpeed")
-                .replacingOccurrences(of: "kimi-for-coding", with: "K2.7")
         }
         return nil
     }
@@ -259,7 +267,22 @@ enum KimiStatusParser {
             rows.append(contentsOf: limits.compactMap { $0 as? [String: Any] })
         }
 
-        let metrics = rows.compactMap(parseRow)
+        var metrics = rows.compactMap(parseRow)
+        let quota = data["quota"] as? [String: Any]
+        if let usages = quota?["usages"] as? [String: Any] {
+            let windows = [
+                ("limit5h", "5-hour allowance"),
+                ("monthTotal", "Monthly total allowance"),
+                ("monthCode", "Monthly code allowance"),
+            ]
+            for (key, label) in windows {
+                guard let usage = usages[key] as? [String: Any],
+                      let ratio = JSONAccess.double(usage["usedRatio"]) else { continue }
+                var row: [String: Any] = ["used": ratio, "limit": 1, "label": label]
+                row["reset_at"] = usage["resetAt"]
+                if let metric = parseRow(row) { metrics.append(metric) }
+            }
+        }
         var detailParts = ["OAuth"]
         if let modelLabel { detailParts.append(modelLabel) }
         if let versionLabel { detailParts.append(versionLabel) }
@@ -270,7 +293,7 @@ enum KimiStatusParser {
             detail: detailParts.joined(separator: " · "),
             health: metrics.isEmpty ? .warning : .ready,
             metrics: metrics,
-            footer: extraUsageFooter(data["extra_usage"]),
+            footer: extraUsageFooter(data["extra_usage"] ?? quota?["extraUsage"]),
             dashboardURL: URL(string: "https://www.kimi.com/code/console?from=kfc_overview_topbar")!
         )
     }

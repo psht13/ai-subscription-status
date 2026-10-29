@@ -4,7 +4,9 @@ enum StatusDiagnostics {
     static func printLiveStatus() {
         let codex = CodexStatusProvider()
 
-        let providers = [codex.fetch()]
+        let kimi = KimiStatusProvider()
+        defer { kimi.stop() }
+        let providers = [codex.fetch(), kimi.fetch()]
         for provider in providers {
             print("\(provider.name) | \(healthName(provider.health)) | \(provider.detail)")
             for metric in provider.metrics {

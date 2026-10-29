@@ -106,6 +106,20 @@ enum StatusSelfTests {
         )
         try check(currentWireSnapshot.metrics.first?.label == "1w limit", "Kimi current window label parsing failed")
         try check(currentWireSnapshot.metrics.first?.resetText != nil, "Kimi fractional reset timestamp parsing failed")
+
+        let modernSnapshot = KimiStatusParser.parse(
+            data: ["kind": "ok", "quota": ["usages": [
+                "limit5h": ["usedRatio": 0.25, "resetAt": "2030-08-05T11:48:39Z"],
+                "monthTotal": ["usedRatio": 0.1],
+                "monthCode": ["usedRatio": 1.2],
+            ]]],
+            versionLabel: "Kimi 2.4.0", modelLabel: "K2.8 Preview"
+        )
+        try check(modernSnapshot.health == .ready, "Modern Kimi usage should be ready")
+        try check(modernSnapshot.metrics.map(\.value) == ["75% left", "90% left", "0% left"], "Kimi ratios must convert to remaining percentages and clamp")
+        try check(modernSnapshot.metrics.map(\.label) == ["5-hour allowance", "Monthly total allowance", "Monthly code allowance"], "Kimi windows should have stable labels and ordering")
+        try check(modernSnapshot.metrics.first?.resetText != nil, "Modern Kimi reset should be parsed")
+
     }
 
     private static func testUsageRefreshRecovery() throws {

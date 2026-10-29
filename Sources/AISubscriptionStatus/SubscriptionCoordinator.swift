@@ -2,18 +2,36 @@ import Foundation
 
 final class SubscriptionCoordinator {
     private let codex = CodexStatusProvider()
-    private var refreshState = UsageRefreshState()
+    private let kimi = KimiStatusProvider()
+    private var codexRefreshState = UsageRefreshState()
+    private var kimiRefreshState = UsageRefreshState()
 
-    var nextRefreshInterval: TimeInterval { refreshState.nextRefreshInterval }
-
-    func refresh() async -> OverallSnapshot {
-        let provider = await Task.detached(priority: .utility) { [codex] in
-            codex.fetch()
-        }.value
-        return refreshState.record(provider, at: Date())
+    var nextRefreshInterval: TimeInterval {
+        min(codexRefreshState.nextRefreshInterval, kimiRefreshState.nextRefreshInterval)
     }
 
-    func shutdown() {}
+    func refresh() async -> OverallSnapshot {
+        async let codexProvider = Task.detached(priority: .utility) { [codex] in
+            codex.fetch()
+        }.value
+        async let kimiProvider = Task.detached(priority: .utility) { [kimi] in
+            kimi.fetch()
+        }.value
+        let providers = await (codexProvider, kimiProvider)
+        let now = Date()
+        let codexSnapshot = codexRefreshState.record(providers.0, at: now)
+        let kimiSnapshot = kimiRefreshState.record(providers.1, at: now)
+        return OverallSnapshot(
+            providers: codexSnapshot.providers + kimiSnapshot.providers,
+            refreshedAt: now
+        )
+    }
 
-    func prepareForCLIUpdate(_ providerID: ProviderID) {}
+    func shutdown() {
+        kimi.stop()
+    }
+
+    func prepareForCLIUpdate(_ providerID: ProviderID) {
+        if providerID == .kimi { kimi.stop() }
+    }
 }

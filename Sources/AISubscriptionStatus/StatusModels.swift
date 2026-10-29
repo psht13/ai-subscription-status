@@ -4,7 +4,7 @@ enum ProviderID: Int, CaseIterable, Comparable {
     case codex
     case kimi
 
-    // Kimi is intentionally disabled while its local installation is not in use.
+    // CLI updates remain limited to Codex. Usage refreshes include both providers.
     static let enabledCases: [ProviderID] = [.codex]
 
     static func < (lhs: ProviderID, rhs: ProviderID) -> Bool {

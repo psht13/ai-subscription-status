@@ -200,7 +200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if isRefreshing {
             refreshTitle = "Refreshing…"
         } else if isUpdatingCLIs {
-            refreshTitle = "Updating Codex…"
+            refreshTitle = "Updating CLIs…"
         } else {
             refreshTitle = "Refresh Usage"
         }
